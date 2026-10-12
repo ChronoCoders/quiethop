@@ -19,10 +19,16 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="$ROOT/scripts/lib/checks.sh"
 [ -r "$LIB" ] || { echo "gate: shared check library unreachable at $LIB" >&2; exit 1; }
+
+# Into this tree before the library is sourced, because the library fixes its
+# root from the working directory at that moment. Started as
+# `bash /elsewhere/gate.sh` from another checkout, the old order gave the
+# library that caller's root, and every step working from it read the caller's
+# files while the header named this tree's commit.
+cd "$ROOT" || exit 1
+
 # shellcheck source=scripts/lib/checks.sh
 . "$LIB"
-
-cd "$ROOT" || exit 1
 
 export PATH="$PATH:$(go env GOPATH 2>/dev/null)/bin:$HOME/.cargo/bin"
 
