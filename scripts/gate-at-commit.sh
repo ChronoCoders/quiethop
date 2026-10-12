@@ -90,7 +90,25 @@ if [ "$found" -ne 0 ]; then
 	exit 1
 fi
 
-bash "$WT/gate.sh" 2>&1 | tee "$LOG"
+# Started from inside the worktree, and never as "bash $WT/gate.sh" from
+# somewhere else. The shared check library fixes its root at the moment it is
+# sourced, from the working directory of whoever started it
+# (scripts/lib/checks.sh, CK_ROOT), and gate.sh sources the library before it
+# changes directory. Launched from the wrong place, every step that works from
+# that root reads the checkout the launcher was run from while the header names
+# the commit in the worktree.
+#
+# The control below proves the library resolved to the worktree, so a later
+# change to either file cannot quietly move the steps back.
+root_seen="$(cd "$WT" && bash -c '. scripts/lib/checks.sh >/dev/null 2>&1; printf "%s" "$CK_ROOT"')"
+if [ "$root_seen" != "$WT" ]; then
+	echo "gate-at-commit: the check library would run against $root_seen, not $WT" >&2
+	exit 1
+fi
+printf 'check library root: %s\n' "$root_seen"
+echo
+
+(cd "$WT" && bash gate.sh) 2>&1 | tee "$LOG"
 status="${PIPESTATUS[0]}"
 
 echo
