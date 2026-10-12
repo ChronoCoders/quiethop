@@ -101,6 +101,69 @@ func TestSecondInstanceSameHourIsByteIdentical(t *testing.T) {
 
 // Concurrent first requests in a new hour must produce exactly one row and
 // identical responses. The loser of the insert race serves the winner's bytes.
+// The lost race serves the stored document, not the one the loser built.
+//
+// The invariant is that two clients in one hour see the same bytes. The winner's
+// row is what every later caller gets, so a publisher that lost the insert must
+// discard its own build and return the stored row, signatures included.
+//
+// Every other test in this file would pass without that: the publishers all
+// build from the same relay set and the signature is deterministic, so a loser's
+// own bytes already equal the winner's and returning them hides the defect. Here
+// the stored row is deliberately something no build can produce, signed by a key
+// the publisher does not hold.
+func TestALosingPublisherServesTheStoredDocument(t *testing.T) {
+	pool := testPool(t)
+	clearDocuments(t, pool)
+	ctx := context.Background()
+	hour := HourOf(time.Date(2026, 10, 9, 8, 30, 0, 0, time.UTC))
+
+	stored := []byte(`{"version":0,"stored":"by another instance"}`)
+	winner := signerFor(t)
+	storedSigs := []Signature{winner.Sign(stored)}
+	storedSigsJSON, err := MarshalSignatures(storedSigs)
+	if err != nil {
+		t.Fatalf("MarshalSignatures: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO registry_documents (version, valid_after, document, signatures)
+		 VALUES ($1, $2, $3, $4)`,
+		VersionFor(hour), hour, stored, storedSigsJSON,
+	); err != nil {
+		t.Fatalf("seed the winner's row: %v", err)
+	}
+
+	loser := NewPublisher(pool, signerFor(t))
+	doc, sigs, err := loser.publish(ctx, hour)
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	if !bytes.Equal(doc, stored) {
+		t.Fatalf("served its own build instead of the stored row: %s", doc)
+	}
+	if len(sigs) != 1 || sigs[0] != storedSigs[0] {
+		t.Fatalf("served %v, want the stored row's %v", sigs, storedSigs)
+	}
+
+	// The control: the loser's own signature over those same bytes differs, so
+	// the assertion above cannot pass by coincidence.
+	own := loser.signer.Sign(stored)
+	if own == storedSigs[0] {
+		t.Fatal("both signers produced the same signature, so this proves nothing")
+	}
+
+	var rows int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM registry_documents WHERE valid_after = $1`, hour,
+	).Scan(&rows); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("%d rows for one hour, want 1", rows)
+	}
+}
+
 // A pool whose connection ceiling is the number of publishers, so the
 // publishers below really do insert at the same time. The default pool caps at
 // the CPU count, which serialises the race this test is about.
