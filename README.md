@@ -1,79 +1,172 @@
 # QuietHop
 
-B2B onion routing infrastructure with cryptographic access control and residential exit IPs.
+B2B onion routing with cryptographic access control and residential exit IPs.
 
 ## What it is
 
-QuietHop is a managed three-hop circuit routing service for businesses that need to make outbound HTTPS requests from an origin the destination cannot attribute to them. Each request travels through three relay hops before exiting through a sticky residential IP. The destination sees a residential address and nothing that ties the request back to your company.
+QuietHop carries outbound HTTP and HTTPS through three relay hops and out of a
+residential IP. At the network level the destination sees a residential address
+and nothing that points back to your company: not your address space, not your
+hostnames.
 
-Access is gated by a blind-signed token, so a relay can check that a request is paid for without learning which subscriber sent it. It does not make you anonymous to us, and the privacy model below says exactly what holds today and what does not.
+What travels inside the request is yours to control. Headers, cookies, tokens and
+the TLS fingerprint of your own HTTP client pass end to end, so a destination
+that reads them can still recognise you. QuietHop changes where a request comes
+from and nothing about what it carries.
 
-Typical workloads: ad verification, brand-safety crawling, competitive pricing intelligence, fraud detection probes, security research, and any traffic where the calling infrastructure must remain decoupled from the corporate IP space.
+Access is gated by a blind-signed token. A relay checks that a request carries a
+token the authority signed, without learning which subscriber sent it, because
+the check is arithmetic on the token against a pinned authority key and needs no
+call home.
+
+Built for workloads such as ad verification, brand-safety crawling, pricing
+intelligence, fraud probes and security research, and any traffic that has to
+leave from somewhere other than your corporate address space.
+
+## How a circuit is built
+
+1. The client signs in to the authority and asks for a blind-signed token. The
+   authority signs without seeing the token value. What it keeps is a per
+   subscriber issuance counter and a row holding a subscriber id and a timestamp.
+2. The client fetches the signed relay registry and picks its own three hops. The
+   authority has no endpoint that assigns a path, and the table that once
+   recorded assignments has been dropped.
+3. The client dials the guard at the address the registry publishes for it and
+   runs one Noise NK handshake per hop, nested through the hops already built,
+   so each relay holds a session key for its own hop only.
+4. The exit checks the destination port against an allowlist and dials out
+   through a residential proxy provider's SOCKS5 exit.
+
+The path rules the client applies are distinct relays, always distinct hosts, and
+never two hops inside one IPv4 /16 or one IPv6 /32. Operator diversity is a
+client setting rather than a registry claim, and it is off by default while one
+operator runs every relay.
 
 ## Privacy model
 
-This section describes the service as it works today. A revised protocol is in progress and is not described here.
+Three principals see different slices of a request.
 
-Three principals see different slices of any request:
+**Authority.** Knows who you are, because you sign in with an account tied to
+your subscription. It signs your token blind, stores no token value, and neither
+chooses nor records which relays you use.
 
-- **Authority** knows who you are, because you sign in with credentials and we bill you. It signs your blind token without seeing the token value you later present, and it keeps a count of how many tokens you were issued rather than the values themselves. It also chooses the three relays for each of your circuits and records that choice against your subscriber id. It never sees request bytes or destinations.
-- **Relay nodes** know that a token carries a valid signature and has not been replayed, plus the previous hop and the next hop. A relay checks the signature offline and never contacts the authority, so a relay on its own does not learn which subscriber a token belongs to.
-- **Exit node** sees the destination host and the innermost layer of plaintext. It does not see your address.
+**Relay.** Knows that a token carried a valid signature and had not been seen
+before, plus the hop before it and the hop after it. The signature check runs
+before the replay check and both must pass. A relay reads no database and shares
+no state with any other relay.
 
-What holds. The destination cannot attribute the request to you, which is the property the product is sold on. A relay taken on its own, without the authority's records, cannot tell which subscriber it is carrying.
+**Exit.** Sees the destination host and the innermost plaintext. It does not see
+your address.
 
-What does not hold. The authority holds both your identity and the path it chose for you, in its own database, so the authority on its own can link a subscription to the relays that carried it. Blinding the token does not change that, because the join happens in tables beside the token rather than through it. Closing that join is part of the revised protocol and is not in the code today.
+What holds today. At the network level the destination cannot attribute the
+request to you, which is the property the design is built around. A relay on its
+own, without the authority's records, cannot say which subscriber it is
+carrying.
 
-**Who operates the relays.** Distributed Systems Labs runs the authority and all three relays today, and that is the initial stage of operation rather than the design. While one party runs every component, that party sees your address when you sign in and again when your client connects to the guard, and it can match the two. No cryptography prevents it, so at this stage the service does not claim unlinkability against us.
+What does not hold today. Distributed Systems Labs, LLC runs the authority and
+all three relays. That party sees your address when you sign in and again when
+your client reaches the guard, and it can match the two. No cryptography
+prevents that, so at this stage the service makes no claim of unlinkability
+against us.
 
-The network is built for relays run by several independent operators, each a separate company under contract. On a path whose three hops belong to three different operators, linking your subscription to your traffic needs all three of them to cooperate or to be compelled, rather than one company reading two of its own tables. Each circuit will report how many distinct operators it crossed, so you can see which guarantee a given circuit carries instead of taking our word for the stage we are in. Customers do not operate relays.
+The protocol is designed so that relays can be run by independent operators
+instead of by one party. Today one party runs all three hops, and no third party
+operates a relay.
+
+Spreading the hops raises the bar without removing the central limit of onion
+routing. A guard and an exit run by the same party, or cooperating, can link a
+client to its destinations: the guard sees the client's address, the exit sees
+the destination, and the timing and volume of what they both carry match a
+circuit up without the middle hop and without breaking any encryption. Tor's own
+design paper puts that attack among its non-goals. Hops at three operators mean
+such a pair has to collude rather than read two of its own tables, which is a
+higher bar and not a guarantee.
+
+A circuit built through the SDK reports how many distinct operators it crossed,
+so an SDK caller can see which bar a given circuit clears. The SOCKS5 daemon
+does not surface that count today.
 
 ## Architecture
 
-| Component | Role |
-|---|---|
-| Authority | Issues blind tokens, manages subscriptions, and selects and records the three relays of each circuit. Reached only through a Cloudflare Tunnel, with no public ingress on the origin host. |
-| Guard relay | First hop. Verifies the client's blind token, terminates the client-side TLS, runs the per-hop X25519 key exchange, which is not authenticated against a relay identity, and forwards encrypted traffic to a middle relay. |
-| Middle relay | Second hop. Relays opaque bytes between guard and exit. Holds neither the client identity nor the destination. |
-| Exit relay | Third hop. Decrypts the innermost layer, validates the destination port against an allowlist, and dials through a Decodo residential dedicated IP. |
-| Residential exit | Decodo sticky dedicated IP. The destination sees this IP as the request source. |
-| Dashboard | Operator self-service for subscription, key management, circuit history, and usage. |
+| Component        | Role                                                             |
+|------------------|------------------------------------------------------------------|
+| Authority        | Go service. Subscriber sign-in, blind token signing, the signed  |
+|                  | relay registry, the dashboard API. PostgreSQL is its only store. |
+| Guard relay      | First hop. Verifies the blind token, terminates the client's     |
+|                  | TLS, and forwards to the middle relay named in the registry.     |
+| Middle relay     | Second hop. Moves opaque bytes between guard and exit.           |
+| Exit relay       | Third hop. Peels the innermost layer, checks the port, and dials |
+|                  | through the residential SOCKS5 address.                          |
+| Residential exit | A residential proxy provider's address, which is the one the     |
+|                  | destination sees.                                                |
+| Dashboard        | Next.js operator console for the subscription and its usage.     |
 
-All relay hops run on port 443 with real Let's Encrypt certificates obtained via TLS-ALPN-01. Inter-relay traffic is itself TLS with verified hostnames, so a passive observer of any single hop sees only HTTPS to a QuietHop hostname.
+Every hop terminates TLS with a real Let's Encrypt certificate obtained over
+TLS-ALPN-01, and a challenge connection is routed away from the circuit handler
+by peeking at the ClientHello. A relay takes its listening port from its own
+`RELAY_PORT`. Traffic between relays is TLS as well, with the server name taken
+from the registry entry and no skip-verify path anywhere, so an observer of one
+hop sees TLS to a QuietHop hostname.
+
+One TLS link between two relays carries many circuits at once. The writer takes
+one frame from one circuit per turn, so a circuit with a backlog cannot hold the
+link, and each circuit has its own flow-control window that opens again as the
+far end acknowledges delivery.
 
 ## Client integration
 
-The product surface is a SOCKS5 daemon plus a Rust SDK. A typical integration looks like:
+The product surface is a SOCKS5 daemon and a Rust SDK.
 
-1. Sign up through the dashboard, complete payment, and wait for approval. Approval is manual.
-2. There is no access key to copy from the dashboard. The daemon obtains tokens itself. Give it your subscriber credentials and it signs in, requests a blind-signed token, and asks the authority for a circuit.
-3. Put those credentials in the daemon's environment (`AUTHORITY_URL`, `CLIENT_EMAIL`, `CLIENT_PASSWORD`, `SOCKS5_BIND`) and run the daemon on the host that needs to make outbound requests.
-4. Point your existing HTTP client at the local SOCKS5 endpoint. Every outbound request transparently builds a fresh three-hop circuit and exits through a residential IP.
+1. Sign up through the dashboard and wait for approval. Approval is manual.
+2. There is no key to copy. Give the daemon your subscriber credentials in
+   `AUTHORITY_URL`, `CLIENT_EMAIL` and `CLIENT_PASSWORD`, and it signs in and
+   obtains tokens itself. `SOCKS5_BIND` sets the local listener, which defaults
+   to 127.0.0.1:1080.
+3. Point your HTTP client at that local endpoint. Each outbound request travels
+   a three-hop circuit and leaves from a residential IP.
 
-The Rust SDK is also exposed directly for applications that prefer in-process integration without the SOCKS5 hop. Both surfaces produce circuits that are functionally identical.
+The SDK is available for applications that prefer to build circuits in process.
 
 ## Stack
 
-- **Authority**: Go, PostgreSQL, JWT sessions, Argon2id password hashing
-- **Relay**: Rust, tokio, rustls, rustls-acme, tokio-socks, rsa and num-bigint for blind token verification
-- **Shared wire protocol**: Rust, x25519-dalek, hkdf, aes-gcm
-- **Client SDK and daemon**: Rust, tokio, rustls, rsa and num-bigint-dig for the blind signature
-- **Dashboard**: Next.js 15 (App Router), shadcn/ui
+- **Authority**: Go, minimum language version 1.25.0 with the toolchain pinned
+  at go1.27.2, PostgreSQL, Argon2id password hashing, HS256 JWT sessions
+- **Relay**: Rust 2021, tokio, rustls, rustls-acme, tokio-socks, num-bigint for
+  the blind token check
+- **Shared wire protocol**: Rust, Noise NK over X25519 with ChaChaPoly and
+  SHA-256
+- **Client SDK and daemon**: Rust, tokio, rustls
+- **Dashboard**: Next.js 15 App Router with React 19, calling the authority
+  through server-side rewrites so the browser never addresses it directly
 
 ## Self-hosting
 
-Not supported. QuietHop runs as managed infrastructure on operator-controlled hosts. The authority, the relay fleet, the residential exit IPs and the certificate lifecycle are run by Distributed Systems Labs today, and relays will also be run by contracted operators as the network grows. Customers do not run relays in either case. Source is published for review under the BSL terms below, not for independent deployment.
-
-If you need a private deployment for compliance reasons, contact us.
+Not supported. QuietHop runs as managed infrastructure. The authority, the relay
+fleet, the residential exits and the certificate lifecycle are operated by
+Distributed Systems Labs, LLC, and the protocol leaves room for other operators
+to run relays later. The repository is public so that the protocol can be read
+and reviewed, which is not the same as a licence to run it; the licence section
+below says what production use is granted.
 
 ## Security model
 
-The authoritative specification defines the cryptographic primitives, the principals and their trust boundaries, the blind-token protocol step by step, and an explicit list of what the system does not protect against. It is not published.
-
-The protocol is being rebuilt against a revised security model that is not published, and this README describes the current implementation rather than that target.
+The specification that defines the primitives, the principals and their trust
+boundaries, the token protocol step by step, and what the system does not protect
+against is not published.
 
 For vulnerability disclosure, see [SECURITY.md](SECURITY.md).
 
 ## License
 
-Business Source License 1.1. The Change Date is 2029-05-23, after which the Licensed Work converts to Apache License 2.0. See [LICENSE](LICENSE) for the full terms.
+Business Source License 1.1, copyright 2026 Distributed Systems Labs, LLC. The
+Change Date is 2029-05-23, after which the Licensed Work converts to the Apache
+License, Version 2.0.
+
+Production use is not granted, with one exception that the Additional Use Grant
+in the licence spells out: a subscriber may run the client components, the
+`quiethop-client` daemon and the `quiethop-client-sdk` crate, in production to
+connect to the QuietHop service while the subscription is active. Everything
+else stays non-production use until the Change Date. See [LICENSE](LICENSE) for
+the terms.
+
+October 2026
