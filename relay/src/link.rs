@@ -1161,6 +1161,118 @@ mod tests {
         assert_eq!(served, 5, "the idle circuit neither blocked nor was served");
     }
 
+    /// A turn's contention label is read as a precondition elsewhere: the
+    /// fairness test in `integration_test.rs` takes a contended count as proof
+    /// that a backlog formed. That reading only holds if a turn is classified
+    /// by what was really waiting, so the classification is pinned here with
+    /// exact counts rather than bounds.
+    ///
+    /// A lone circuit is never contended, however long its own backlog: there
+    /// was nothing else for the writer to choose between.
+    #[test]
+    fn a_lone_circuits_turns_are_all_uncontended() {
+        const FRAMES: u64 = 4;
+        let turns = crate::metrics::WriterTurnTally::new();
+        let mut t = LinkTable::new(
+            LinkRole::Responder,
+            MAX_CIRCUITS_PER_LINK,
+            Budget::new(),
+            turns.clone(),
+        );
+        let alone = id(0x80);
+        t.accept_create(alone, transport(), Instant::now()).unwrap();
+        for _ in 0..FRAMES {
+            t.push_out(alone, vec![0x01]).unwrap();
+        }
+
+        for _ in 0..FRAMES {
+            assert!(
+                t.pop_next_out().is_some(),
+                "a queued frame did not come out"
+            );
+        }
+
+        assert_eq!(
+            turns.count(false),
+            FRAMES,
+            "one circuit was waiting on every turn"
+        );
+        assert_eq!(
+            turns.count(true),
+            0,
+            "nothing else was queued, so no turn was contended"
+        );
+
+        // An empty rotation is not a turn at all.
+        assert!(t.pop_next_out().is_none(), "the queue was drained above");
+        assert_eq!(
+            turns.count(false),
+            FRAMES,
+            "a turn was counted with nothing queued"
+        );
+        assert_eq!(
+            turns.count(true),
+            0,
+            "a contended turn was counted with nothing queued"
+        );
+    }
+
+    /// Two backlogged circuits, then one. `busy` holds three frames and
+    /// `short` holds one, so the first two turns have both waiting and the two
+    /// after them have only `busy` left. The split is exact.
+    #[test]
+    fn turns_are_contended_only_while_a_second_circuit_waits() {
+        let turns = crate::metrics::WriterTurnTally::new();
+        let mut t = LinkTable::new(
+            LinkRole::Responder,
+            MAX_CIRCUITS_PER_LINK,
+            Budget::new(),
+            turns.clone(),
+        );
+        let busy = id(0x81);
+        let short = id(0x82);
+        t.accept_create(busy, transport(), Instant::now()).unwrap();
+        t.accept_create(short, transport(), Instant::now()).unwrap();
+        for _ in 0..3 {
+            t.push_out(busy, vec![0xAA]).unwrap();
+        }
+        t.push_out(short, vec![0xBB]).unwrap();
+
+        let both: Vec<CircId> = (0..2)
+            .filter_map(|_| t.pop_next_out().map(|(i, _)| i))
+            .collect();
+        assert_eq!(
+            both,
+            vec![busy, short],
+            "both circuits held frames, so the writer alternated"
+        );
+        assert_eq!(
+            turns.count(true),
+            2,
+            "a second circuit was waiting on both turns"
+        );
+        assert_eq!(turns.count(false), 0, "neither of those turns was alone");
+
+        let alone: Vec<CircId> = (0..2)
+            .filter_map(|_| t.pop_next_out().map(|(i, _)| i))
+            .collect();
+        assert_eq!(
+            alone,
+            vec![busy, busy],
+            "short drained, so busy is served alone"
+        );
+        assert_eq!(
+            turns.count(true),
+            2,
+            "a turn with one circuit left was counted contended"
+        );
+        assert_eq!(
+            turns.count(false),
+            2,
+            "both turns after short drained were alone"
+        );
+    }
+
     /// Destroying a circuit removes it from the rotation, so the writer does
     /// not spin on an id that no longer exists.
     #[test]
