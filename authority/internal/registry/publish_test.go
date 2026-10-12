@@ -101,6 +101,103 @@ func TestSecondInstanceSameHourIsByteIdentical(t *testing.T) {
 
 // Concurrent first requests in a new hour must produce exactly one row and
 // identical responses. The loser of the insert race serves the winner's bytes.
+// A pool whose connection ceiling is the number of publishers, so the
+// publishers below really do insert at the same time. The default pool caps at
+// the CPU count, which serialises the race this test is about.
+func racePool(t *testing.T, maxConns int32) *pgxpool.Pool {
+	t.Helper()
+	url, err := dbtest.URL()
+	if err != nil {
+		t.Fatalf("test database: %v", err)
+	}
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		t.Fatalf("parse pool config: %v", err)
+	}
+	cfg.MaxConns = maxConns
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// The invariant: one document per hour, and every caller racing for that hour
+// gets the same bytes back, with no error.
+//
+// registry_documents has two unique constraints for one hour, the version
+// primary key and valid_after (migration 008), and every publisher for an hour
+// builds the same value for both. A losing insert must take the no-op path on
+// whichever one it collides with. An ON CONFLICT clause naming a single arbiter
+// leaves the other free to raise 23505, which reaches the caller as
+// "insert document: duplicate key value ...".
+//
+// Many publishers released together, and the race repeated round after round on
+// its own hour, so the window is hit on every run rather than once in several.
+func TestConcurrentPublishersNeverSurfaceAConflict(t *testing.T) {
+	const publishers = 16
+	const rounds = 25
+
+	pool := racePool(t, publishers)
+	clearDocuments(t, pool)
+	ctx := context.Background()
+	base := time.Date(2026, 10, 7, 15, 0, 0, 0, time.UTC)
+
+	for round := 0; round < rounds; round++ {
+		// A fresh hour and fresh publishers, so no stored row and no remembered
+		// document can answer before the insert runs.
+		now := base.Add(time.Duration(round) * time.Hour)
+		docs := make([][]byte, publishers)
+		errs := make([]error, publishers)
+		pubs := make([]*Publisher, publishers)
+		for i := range pubs {
+			pubs[i] = NewPublisher(pool, signerFor(t))
+		}
+
+		var ready, done sync.WaitGroup
+		start := make(chan struct{})
+		for i := 0; i < publishers; i++ {
+			ready.Add(1)
+			done.Add(1)
+			go func(i int) {
+				defer done.Done()
+				ready.Done()
+				<-start
+				docs[i], _, errs[i] = pubs[i].Current(ctx, now)
+			}(i)
+		}
+		ready.Wait()
+		close(start)
+		done.Wait()
+
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d, publisher %d: %v", round, i, err)
+			}
+		}
+		for i := 1; i < publishers; i++ {
+			if !bytes.Equal(docs[0], docs[i]) {
+				t.Fatalf("round %d: publisher %d served different bytes from publisher 0", round, i)
+			}
+		}
+		var rows int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM registry_documents WHERE valid_after = $1`, HourOf(now),
+		).Scan(&rows); err != nil {
+			t.Fatalf("round %d: count: %v", round, err)
+		}
+		if rows != 1 {
+			t.Fatalf("round %d: %d rows for one hour, want 1", round, rows)
+		}
+	}
+}
+
 func TestConcurrentFirstRequestsProduceOneRow(t *testing.T) {
 	pool := testPool(t)
 	clearDocuments(t, pool)
