@@ -165,8 +165,11 @@ License, Version 2.0.
 Production use is not granted, with one exception that the Additional Use Grant
 in the licence spells out: a subscriber may run the client components, the
 `quiethop-client` daemon and the `quiethop-client-sdk` crate, in production to
-connect to the QuietHop service while the subscription is active. Everything
-else stays non-production use until the Change Date. See [LICENSE](LICENSE) for
-the terms.
+connect to the QuietHop service while the subscription is active. The grant
+reaches whatever those components depend on, which today is `quiethop-crypto`,
+when it runs as part of them. It reaches no further, so a relay and the
+authority stay non-production use even though they share crates with the
+client. Everything else stays non-production use until the Change Date. See
+[LICENSE](LICENSE) for the terms.
 
 October 2026
