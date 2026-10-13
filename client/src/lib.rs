@@ -12,6 +12,19 @@ mod tls;
 mod tokens;
 
 pub use auth::Session;
+/// Build one circuit from a token and a path, over a caller-supplied TLS
+/// connector.
+///
+/// [`QuietHopClient::dial`] is the usual way in and builds its connector from
+/// the host's native roots. This one leaves the connector to the caller, which
+/// means it can reach a relay whose certificate no native root signs.
+///
+/// Behind `test-util` and absent from a default build for that reason: a
+/// customer facing API should not offer a way around the SDK's own trust roots.
+/// The end-to-end test needs it, and `probes/sdk-default-build` is what proves
+/// a default build does not carry it.
+#[cfg(feature = "test-util")]
+pub use dial::dial;
 pub use dial::CircuitStream;
 pub use error::ClientError;
 pub use path::{NoPathReason, PathRules, SelectedPath};

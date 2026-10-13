@@ -71,8 +71,12 @@ func (p *Publisher) Current(ctx context.Context, now time.Time) ([]byte, []Signa
 	return built, sigs, nil
 }
 
-// publish builds, signs and stores the document for one hour. On a unique
-// conflict another instance or request won the race, and its row is served.
+// publish builds, signs and stores the document for one hour. On a conflict on
+// either unique constraint, the version primary key or valid_after, another
+// instance or request won the race and its row is served. The clause names no
+// arbiter on purpose: both constraints collide for the same hour, and naming one
+// of them let the other raise 23505 out of a losing insert instead of taking the
+// no-op path.
 func (p *Publisher) publish(ctx context.Context, hour time.Time) ([]byte, []Signature, error) {
 	relays, err := p.activeRelays(ctx)
 	if err != nil {
@@ -99,7 +103,7 @@ func (p *Publisher) publish(ctx context.Context, hour time.Time) ([]byte, []Sign
 	tag, err := p.pool.Exec(ctx,
 		`INSERT INTO registry_documents (version, valid_after, document, signatures)
 		 VALUES ($1, $2, $3, $4)
-		 ON CONFLICT (valid_after) DO NOTHING`,
+		 ON CONFLICT DO NOTHING`,
 		VersionFor(hour), hour, bytes, sigsJSON,
 	)
 	if err != nil {

@@ -16,6 +16,8 @@ serde = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
+# Circuit ids are drawn at random among unused values (DECISIONS 20).
+rand = { workspace = true }
 url = { workspace = true }
 tokio-socks = "0.5"
 tokio-rustls = { workspace = true }
@@ -25,6 +27,16 @@ rustls-native-certs = { workspace = true }
 futures-util = { workspace = true }
 
 [dev-dependencies]
+# The merge condition is an end-to-end test driven by the real SDK rather than
+# a mock client, and the harness that stands up three relays in-process lives in
+# this crate. The relay is a binary, so nothing here can be imported from a test
+# crate elsewhere; a dev dependency is what lets the SDK reach the harness
+# without reaching the shipped binary. No cycle: the SDK does not depend on the
+# relay (STATUS_REPORT, the client design report).
+quiethop-client-sdk = { path = "../client", features = ["test-util"] }
 rcgen = "0.13"
 rand_core = { workspace = true }
 tempfile = "3"
+# test-util alone, for paused time in the write timeout tests. A dev dependency
+# so the shipped binary cannot pause its own clock.
+tokio = { workspace = true, features = ["test-util"] }

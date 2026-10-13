@@ -101,6 +101,166 @@ func TestSecondInstanceSameHourIsByteIdentical(t *testing.T) {
 
 // Concurrent first requests in a new hour must produce exactly one row and
 // identical responses. The loser of the insert race serves the winner's bytes.
+// The lost race serves the stored document, not the one the loser built.
+//
+// The invariant is that two clients in one hour see the same bytes. The winner's
+// row is what every later caller gets, so a publisher that lost the insert must
+// discard its own build and return the stored row, signatures included.
+//
+// Every other test in this file would pass without that: the publishers all
+// build from the same relay set and the signature is deterministic, so a loser's
+// own bytes already equal the winner's and returning them hides the defect. Here
+// the stored row is deliberately something no build can produce, signed by a key
+// the publisher does not hold.
+func TestALosingPublisherServesTheStoredDocument(t *testing.T) {
+	pool := testPool(t)
+	clearDocuments(t, pool)
+	ctx := context.Background()
+	hour := HourOf(time.Date(2026, 10, 9, 8, 30, 0, 0, time.UTC))
+
+	stored := []byte(`{"version":0,"stored":"by another instance"}`)
+	winner := signerFor(t)
+	storedSigs := []Signature{winner.Sign(stored)}
+	storedSigsJSON, err := MarshalSignatures(storedSigs)
+	if err != nil {
+		t.Fatalf("MarshalSignatures: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO registry_documents (version, valid_after, document, signatures)
+		 VALUES ($1, $2, $3, $4)`,
+		VersionFor(hour), hour, stored, storedSigsJSON,
+	); err != nil {
+		t.Fatalf("seed the winner's row: %v", err)
+	}
+
+	loser := NewPublisher(pool, signerFor(t))
+	doc, sigs, err := loser.publish(ctx, hour)
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	if !bytes.Equal(doc, stored) {
+		t.Fatalf("served its own build instead of the stored row: %s", doc)
+	}
+	if len(sigs) != 1 || sigs[0] != storedSigs[0] {
+		t.Fatalf("served %v, want the stored row's %v", sigs, storedSigs)
+	}
+
+	// The control: the loser's own signature over those same bytes differs, so
+	// the assertion above cannot pass by coincidence.
+	own := loser.signer.Sign(stored)
+	if own == storedSigs[0] {
+		t.Fatal("both signers produced the same signature, so this proves nothing")
+	}
+
+	var rows int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM registry_documents WHERE valid_after = $1`, hour,
+	).Scan(&rows); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("%d rows for one hour, want 1", rows)
+	}
+}
+
+// A pool whose connection ceiling is the number of publishers, so the
+// publishers below really do insert at the same time. The default pool caps at
+// the CPU count, which serialises the race this test is about.
+func racePool(t *testing.T, maxConns int32) *pgxpool.Pool {
+	t.Helper()
+	url, err := dbtest.URL()
+	if err != nil {
+		t.Fatalf("test database: %v", err)
+	}
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		t.Fatalf("parse pool config: %v", err)
+	}
+	cfg.MaxConns = maxConns
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// The invariant: one document per hour, and every caller racing for that hour
+// gets the same bytes back, with no error.
+//
+// registry_documents has two unique constraints for one hour, the version
+// primary key and valid_after (migration 008), and every publisher for an hour
+// builds the same value for both. A losing insert must take the no-op path on
+// whichever one it collides with. An ON CONFLICT clause naming a single arbiter
+// leaves the other free to raise 23505, which reaches the caller as
+// "insert document: duplicate key value ...".
+//
+// Many publishers released together, and the race repeated round after round on
+// its own hour, so the window is hit on every run rather than once in several.
+func TestConcurrentPublishersNeverSurfaceAConflict(t *testing.T) {
+	const publishers = 16
+	const rounds = 25
+
+	pool := racePool(t, publishers)
+	clearDocuments(t, pool)
+	ctx := context.Background()
+	base := time.Date(2026, 10, 7, 15, 0, 0, 0, time.UTC)
+
+	for round := 0; round < rounds; round++ {
+		// A fresh hour and fresh publishers, so no stored row and no remembered
+		// document can answer before the insert runs.
+		now := base.Add(time.Duration(round) * time.Hour)
+		docs := make([][]byte, publishers)
+		errs := make([]error, publishers)
+		pubs := make([]*Publisher, publishers)
+		for i := range pubs {
+			pubs[i] = NewPublisher(pool, signerFor(t))
+		}
+
+		var ready, done sync.WaitGroup
+		start := make(chan struct{})
+		for i := 0; i < publishers; i++ {
+			ready.Add(1)
+			done.Add(1)
+			go func(i int) {
+				defer done.Done()
+				ready.Done()
+				<-start
+				docs[i], _, errs[i] = pubs[i].Current(ctx, now)
+			}(i)
+		}
+		ready.Wait()
+		close(start)
+		done.Wait()
+
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d, publisher %d: %v", round, i, err)
+			}
+		}
+		for i := 1; i < publishers; i++ {
+			if !bytes.Equal(docs[0], docs[i]) {
+				t.Fatalf("round %d: publisher %d served different bytes from publisher 0", round, i)
+			}
+		}
+		var rows int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM registry_documents WHERE valid_after = $1`, HourOf(now),
+		).Scan(&rows); err != nil {
+			t.Fatalf("round %d: count: %v", round, err)
+		}
+		if rows != 1 {
+			t.Fatalf("round %d: %d rows for one hour, want 1", round, rows)
+		}
+	}
+}
+
 func TestConcurrentFirstRequestsProduceOneRow(t *testing.T) {
 	pool := testPool(t)
 	clearDocuments(t, pool)

@@ -13,6 +13,7 @@
 //! reverse: [`peel`] until it returns [`Peeled::ToMe`].
 
 use crate::cell::{body_len, link_cell_len, Cell, CellError, CELL_PLAINTEXT_LEN};
+use crate::layers::Layers;
 use crate::noise::{NoiseError, Transport, NOISE_TAG_LEN};
 use crate::wire::{DISPOSITION_FORWARD, DISPOSITION_LEN, DISPOSITION_TO_ME};
 
@@ -118,10 +119,11 @@ impl<R: tokio::io::AsyncRead + Unpin> FrameReader<R> {
             // Read only as far as the end of the frame being assembled.
             // Sizing this to the whole scratch buffer would let one read take
             // the rest of the frame plus the bytes after it, and those bytes
-            // would then be dropped along with this reader. On a relay's
-            // inbound link they are the next circuit's CIRCUIT_START and
-            // handshake message. `pending` is below frame_len here, because a
-            // full frame was already drained above, so room is at least 1.
+            // would then be dropped along with this reader. On a multiplexed
+            // link they are the start of another circuit's frame, and losing
+            // them would misalign every frame after it. `pending` is below
+            // frame_len here, because a full frame was already drained above,
+            // so room is at least 1.
             let room = self.scratch.len() - self.acc.pending();
             let n = self.inner.read(&mut self.scratch[..room]).await?;
             if n == 0 {
@@ -177,7 +179,7 @@ pub enum Peeled {
 ///
 /// Returns exactly `link_cell_len(layers)` bytes. The body is zero-padded, so
 /// the output size never depends on the payload.
-pub fn seal_to_me(tx: &mut Transport, cell: &Cell, layers: usize) -> Result<Vec<u8>, LayerError> {
+pub fn seal_to_me(tx: &mut Transport, cell: &Cell, layers: Layers) -> Result<Vec<u8>, LayerError> {
     let body = body_len(layers);
     let mut plain = vec![0u8; DISPOSITION_LEN + body];
     plain[0] = DISPOSITION_TO_ME;
@@ -194,8 +196,12 @@ pub fn seal_to_me(tx: &mut Transport, cell: &Cell, layers: usize) -> Result<Vec<
 /// `blob` must be exactly the adjacent link's cell size. Accepting any length
 /// would let a caller emit a frame that is not the fixed size for its link,
 /// which is the one property the whole layout exists to hold.
-pub fn seal_forward(tx: &mut Transport, blob: &[u8], layers: usize) -> Result<Vec<u8>, LayerError> {
-    let want = link_cell_len(layers - 1);
+pub fn seal_forward(
+    tx: &mut Transport,
+    blob: &[u8],
+    layers: Layers,
+) -> Result<Vec<u8>, LayerError> {
+    let want = link_cell_len(layers.peeled());
     if blob.len() != want {
         return Err(LayerError::WrongSize {
             got: blob.len(),
@@ -214,7 +220,7 @@ pub fn seal_forward(tx: &mut Transport, blob: &[u8], layers: usize) -> Result<Ve
 ///
 /// `wire` must be exactly `link_cell_len(layers)` bytes; the caller reads that
 /// many because the size is fixed and no length appears on the wire.
-pub fn peel(tx: &mut Transport, wire: &[u8], layers: usize) -> Result<Peeled, LayerError> {
+pub fn peel(tx: &mut Transport, wire: &[u8], layers: Layers) -> Result<Peeled, LayerError> {
     let want = link_cell_len(layers);
     if wire.len() != want {
         return Err(LayerError::WrongSize {
@@ -240,7 +246,7 @@ pub fn peel(tx: &mut Transport, wire: &[u8], layers: usize) -> Result<Peeled, La
             Ok(Peeled::ToMe(cell))
         }
         DISPOSITION_FORWARD => {
-            if layers == 1 {
+            if layers == Layers::new(1) {
                 return Err(LayerError::ForwardAtInnermost);
             }
             Ok(Peeled::Forward(plain[DISPOSITION_LEN..].to_vec()))
@@ -264,7 +270,8 @@ mod tests {
 
     #[test]
     fn to_me_round_trips_at_every_depth() {
-        for layers in 1..=3 {
+        for n in 1..=3 {
+            let layers = Layers::new(n);
             let (mut client, mut relay) = pair();
             let cell = Cell::new(CellType::Data, vec![0x5A; 100]).unwrap();
             let wire = seal_to_me(&mut client, &cell, layers).unwrap();
@@ -278,7 +285,8 @@ mod tests {
 
     #[test]
     fn on_wire_size_is_constant_regardless_of_payload() {
-        for layers in 1..=3 {
+        for n in 1..=3 {
+            let layers = Layers::new(n);
             let want = link_cell_len(layers);
             for n in [0usize, 1, 7, 200, crate::cell::CELL_PAYLOAD_LEN] {
                 let (mut client, _) = pair();
@@ -298,10 +306,10 @@ mod tests {
     fn forward_round_trips_and_sizes_telescope() {
         // middle->exit cell forwarded by the middle, wrapped for guard->middle.
         let (mut client, mut relay) = pair();
-        let blob = vec![0xC3; link_cell_len(1)];
-        let wire = seal_forward(&mut client, &blob, 2).unwrap();
-        assert_eq!(wire.len(), link_cell_len(2));
-        match peel(&mut relay, &wire, 2).unwrap() {
+        let blob = vec![0xC3; link_cell_len(Layers::new(1))];
+        let wire = seal_forward(&mut client, &blob, Layers::new(2)).unwrap();
+        assert_eq!(wire.len(), link_cell_len(Layers::new(2)));
+        match peel(&mut relay, &wire, Layers::new(2)).unwrap() {
             Peeled::Forward(got) => assert_eq!(got, blob),
             Peeled::ToMe(_) => panic!("expected Forward"),
         }
@@ -314,25 +322,25 @@ mod tests {
         let (mut k_guard, mut guard_rx) = pair();
 
         let cell = Cell::new(CellType::Data, b"payload".to_vec()).unwrap();
-        let inner = seal_to_me(&mut k_exit, &cell, 1).unwrap();
+        let inner = seal_to_me(&mut k_exit, &cell, Layers::new(1)).unwrap();
         assert_eq!(inner.len(), 530);
-        let mid = seal_forward(&mut k_mid, &inner, 2).unwrap();
+        let mid = seal_forward(&mut k_mid, &inner, Layers::new(2)).unwrap();
         assert_eq!(mid.len(), 547);
-        let outer = seal_forward(&mut k_guard, &mid, 3).unwrap();
+        let outer = seal_forward(&mut k_guard, &mid, Layers::new(3)).unwrap();
         assert_eq!(outer.len(), 564);
 
         // Guard peels and forwards, middle peels and forwards, exit reads.
-        let fwd1 = match peel(&mut guard_rx, &outer, 3).unwrap() {
+        let fwd1 = match peel(&mut guard_rx, &outer, Layers::new(3)).unwrap() {
             Peeled::Forward(b) => b,
             Peeled::ToMe(_) => panic!("guard got ToMe"),
         };
         assert_eq!(fwd1.len(), 547);
-        let fwd2 = match peel(&mut mid_rx, &fwd1, 2).unwrap() {
+        let fwd2 = match peel(&mut mid_rx, &fwd1, Layers::new(2)).unwrap() {
             Peeled::Forward(b) => b,
             Peeled::ToMe(_) => panic!("middle got ToMe"),
         };
         assert_eq!(fwd2.len(), 530);
-        match peel(&mut exit_rx, &fwd2, 1).unwrap() {
+        match peel(&mut exit_rx, &fwd2, Layers::new(1)).unwrap() {
             Peeled::ToMe(got) => assert_eq!(got, cell),
             Peeled::Forward(_) => panic!("exit got Forward"),
         }
@@ -342,10 +350,12 @@ mod tests {
     fn peel_rejects_a_wrong_size_frame() {
         let (mut client, mut relay) = pair();
         let cell = Cell::new(CellType::Data, Vec::new()).unwrap();
-        let wire = seal_to_me(&mut client, &cell, 3).unwrap();
+        let wire = seal_to_me(&mut client, &cell, Layers::new(3)).unwrap();
         for bad in [&wire[..wire.len() - 1], &wire[..1]] {
-            match peel(&mut relay, bad, 3) {
-                Err(LayerError::WrongSize { want, .. }) => assert_eq!(want, link_cell_len(3)),
+            match peel(&mut relay, bad, Layers::new(3)) {
+                Err(LayerError::WrongSize { want, .. }) => {
+                    assert_eq!(want, link_cell_len(Layers::new(3)))
+                }
                 other => panic!("short frame accepted: {other:?}"),
             }
         }
@@ -355,10 +365,10 @@ mod tests {
     fn peel_rejects_a_tampered_frame() {
         let (mut client, mut relay) = pair();
         let cell = Cell::new(CellType::Data, b"x".to_vec()).unwrap();
-        let mut wire = seal_to_me(&mut client, &cell, 3).unwrap();
+        let mut wire = seal_to_me(&mut client, &cell, Layers::new(3)).unwrap();
         wire[20] ^= 0x01;
         assert!(matches!(
-            peel(&mut relay, &wire, 3),
+            peel(&mut relay, &wire, Layers::new(3)),
             Err(LayerError::Noise(_))
         ));
     }
@@ -367,7 +377,7 @@ mod tests {
     fn peel_rejects_dirty_padding() {
         // Build a TO_ME plaintext by hand with a nonzero padding byte.
         let (mut client, mut relay) = pair();
-        let layers = 3;
+        let layers = Layers::new(3);
         let body = body_len(layers);
         let mut plain = vec![0u8; DISPOSITION_LEN + body];
         plain[0] = DISPOSITION_TO_ME;
@@ -388,7 +398,7 @@ mod tests {
     #[test]
     fn peel_rejects_an_unknown_disposition() {
         let (mut client, mut relay) = pair();
-        let layers = 3;
+        let layers = Layers::new(3);
         let mut plain = vec![0u8; DISPOSITION_LEN + body_len(layers)];
         plain[0] = 0x7F;
         let mut wire = vec![0u8; plain.len() + NOISE_TAG_LEN];
@@ -402,12 +412,12 @@ mod tests {
     #[test]
     fn forward_is_illegal_at_the_innermost_layer() {
         let (mut client, mut relay) = pair();
-        let mut plain = vec![0u8; DISPOSITION_LEN + body_len(1)];
+        let mut plain = vec![0u8; DISPOSITION_LEN + body_len(Layers::new(1))];
         plain[0] = DISPOSITION_FORWARD;
         let mut wire = vec![0u8; plain.len() + NOISE_TAG_LEN];
         client.encrypt(&plain, &mut wire).unwrap();
         assert!(matches!(
-            peel(&mut relay, &wire, 1),
+            peel(&mut relay, &wire, Layers::new(1)),
             Err(LayerError::ForwardAtInnermost)
         ));
     }
@@ -415,22 +425,22 @@ mod tests {
     #[test]
     fn seal_forward_rejects_a_blob_that_is_not_the_adjacent_link_size() {
         let (mut client, _) = pair();
-        let right = vec![0u8; link_cell_len(1)];
+        let right = vec![0u8; link_cell_len(Layers::new(1))];
         // Control: the correct size is accepted at this depth.
-        assert!(seal_forward(&mut client, &right, 2).is_ok());
+        assert!(seal_forward(&mut client, &right, Layers::new(2)).is_ok());
 
         for bad in [
-            link_cell_len(1) - 1,
-            link_cell_len(1) + 1,
+            link_cell_len(Layers::new(1)) - 1,
+            link_cell_len(Layers::new(1)) + 1,
             0,
-            link_cell_len(2),
+            link_cell_len(Layers::new(2)),
         ] {
             let (mut c, _) = pair();
             let blob = vec![0u8; bad];
-            match seal_forward(&mut c, &blob, 2) {
+            match seal_forward(&mut c, &blob, Layers::new(2)) {
                 Err(LayerError::WrongSize { got, want }) => {
                     assert_eq!(got, bad);
-                    assert_eq!(want, link_cell_len(1));
+                    assert_eq!(want, link_cell_len(Layers::new(1)));
                 }
                 other => panic!("blob of {bad} bytes was accepted at depth 2: {other:?}"),
             }
@@ -441,19 +451,19 @@ mod tests {
     fn seal_forward_wants_the_depth_specific_size() {
         // The same blob is right at one depth and wrong at another, so the
         // parameter is doing work rather than being decorative.
-        let blob = vec![0u8; link_cell_len(2)];
+        let blob = vec![0u8; link_cell_len(Layers::new(2))];
         let (mut a, _) = pair();
-        assert!(seal_forward(&mut a, &blob, 3).is_ok());
+        assert!(seal_forward(&mut a, &blob, Layers::new(3)).is_ok());
         let (mut b, _) = pair();
         assert!(matches!(
-            seal_forward(&mut b, &blob, 2),
+            seal_forward(&mut b, &blob, Layers::new(2)),
             Err(LayerError::WrongSize { .. })
         ));
     }
 
     #[test]
     fn accumulator_yields_whole_frames_from_dribbled_bytes() {
-        let n = link_cell_len(3);
+        let n = link_cell_len(Layers::new(3));
         let mut acc = FrameAccumulator::new(n);
         let frame: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
 
@@ -476,7 +486,7 @@ mod tests {
 
     #[test]
     fn accumulator_keeps_a_partial_frame_and_splits_several() {
-        let n = link_cell_len(1);
+        let n = link_cell_len(Layers::new(1));
         let mut acc = FrameAccumulator::new(n);
         acc.push(&vec![1u8; n - 1]);
         assert!(acc.next_frame().is_none(), "a partial frame must not yield");
@@ -497,10 +507,10 @@ mod tests {
     fn replayed_frame_is_rejected_at_the_layer() {
         let (mut client, mut relay) = pair();
         let cell = Cell::new(CellType::Data, b"once".to_vec()).unwrap();
-        let wire = seal_to_me(&mut client, &cell, 3).unwrap();
-        assert!(peel(&mut relay, &wire, 3).is_ok());
+        let wire = seal_to_me(&mut client, &cell, Layers::new(3)).unwrap();
+        assert!(peel(&mut relay, &wire, Layers::new(3)).is_ok());
         assert!(matches!(
-            peel(&mut relay, &wire, 3),
+            peel(&mut relay, &wire, Layers::new(3)),
             Err(LayerError::Noise(_))
         ));
     }
@@ -602,8 +612,8 @@ mod cancel_safety {
     /// With a partial frame buffered, a read sized to the whole scratch buffer
     /// can take the rest of the frame plus the bytes that follow it. Those
     /// trailing bytes then live inside the reader, and anything that drops the
-    /// reader drops them. On a relay's inbound link the bytes after a cell are
-    /// the next circuit's CIRCUIT_START and handshake message.
+    /// reader drops them. On a multiplexed link the bytes after a frame are the
+    /// start of another circuit's frame.
     #[tokio::test]
     async fn next_frame_never_reads_past_the_frame_it_returns() {
         let (mut tx, rx) = tokio::io::duplex(1024);

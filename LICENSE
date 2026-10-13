@@ -5,7 +5,18 @@ Parameters
 Licensor:             Distributed Systems Labs, LLC
 Licensed Work:        QuietHop
                       The Licensed Work is (c) 2026 Distributed Systems Labs, LLC.
-Additional Use Grant: None
+Additional Use Grant: You may make production use of the client components of
+                      the Licensed Work, namely the quiethop-client daemon in
+                      quiethop-client/ and the quiethop-client-sdk crate in
+                      client/, and of every other part of the Licensed Work
+                      that those components depend on, when it is used as part
+                      of those components. A shared part carries no grant
+                      outside that use, so running a relay or the authority
+                      stays non-production use even where it depends on the
+                      same parts. This grant applies solely to connect to the
+                      QuietHop service operated by the Licensor while you hold
+                      an active subscription to that service. No other
+                      production use is granted.
 Change Date:          2029-05-23
 Change License:       Apache License, Version 2.0
 

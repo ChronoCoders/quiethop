@@ -19,14 +19,23 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="$ROOT/scripts/lib/checks.sh"
 [ -r "$LIB" ] || { echo "gate: shared check library unreachable at $LIB" >&2; exit 1; }
+
+# Into this tree before the library is sourced, because the library fixes its
+# root from the working directory at that moment. Started as
+# `bash /elsewhere/gate.sh` from another checkout, the old order gave the
+# library that caller's root, and every step working from it read the caller's
+# files while the header named this tree's commit.
+cd "$ROOT" || exit 1
+
 # shellcheck source=scripts/lib/checks.sh
 . "$LIB"
-
-cd "$ROOT" || exit 1
 
 export PATH="$PATH:$(go env GOPATH 2>/dev/null)/bin:$HOME/.cargo/bin"
 
 echo "gate: $(git rev-parse --short HEAD 2>/dev/null || echo 'no HEAD') on $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+# Two Go toolchains on purpose, see docs/DECISIONS.md entry 21 and the label on
+# each Go step below.
+echo "go: $(ck_go_toolchain) for every Go step except staticcheck, which runs under $(ck_staticcheck_toolchain)"
 echo
 
 ck_step "control: the dash class matches dashes and nothing else" ck_dash_self_test
@@ -47,15 +56,16 @@ ck_step "cargo fmt"      ck_run cargo fmt --all --check
 ck_step "cargo clippy"   ck_run cargo clippy --workspace --all-targets --all-features -- -D warnings
 ck_step "cargo test"     ck_run cargo test --workspace
 ck_step "cargo audit"    ck_cargo_audit
+ck_step "the sdk's low level dial is absent from a default build" ck_sdk_dial_gated
 
 ck_step "go build"       ck_run_in authority go build ./...
 ck_step "go vet"         ck_run_in authority go vet ./...
 ck_step "gofmt"          ck_gofmt
-ck_step "staticcheck"    ck_run_in authority staticcheck ./...
+ck_step "staticcheck ($(ck_staticcheck_toolchain))" ck_staticcheck
 ck_step "control: the database check fails with no server" ck_test_db_control
 ck_step "the test database is reachable with a complete schema" ck_test_db
 ck_step "go test"        ck_go_test
-ck_step "govulncheck"    ck_run_in authority govulncheck ./...
+ck_step "govulncheck ($(ck_go_toolchain))"          ck_govulncheck
 
 ck_step "tsc"            ck_run_in dashboard npx --no-install tsc --noEmit
 ck_step "eslint"         ck_run_in dashboard npx --no-install eslint . --max-warnings=0
