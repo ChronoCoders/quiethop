@@ -167,9 +167,10 @@ in the licence spells out: a subscriber may run the client components, the
 `quiethop-client` daemon and the `quiethop-client-sdk` crate, in production to
 connect to the QuietHop service while the subscription is active. The grant
 reaches whatever those components depend on, which today is `quiethop-crypto`,
-when it runs as part of them. It reaches no further, so a relay and the
-authority stay non-production use even though they share crates with the
-client. Everything else stays non-production use until the Change Date. See
-[LICENSE](LICENSE) for the terms.
+when it runs as part of them. It reaches no further. A relay stays
+non-production use even though it shares `quiethop-crypto` with the client, and
+so does the authority, which is Go and shares no crate at all. Everything else
+stays non-production use until the Change Date. See [LICENSE](LICENSE) for the
+terms.
 
 October 2026
